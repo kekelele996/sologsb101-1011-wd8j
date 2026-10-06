@@ -71,15 +71,17 @@ async function refreshCounts(): Promise<void> {
 
 async function buildConclusions(): Promise<void> {
   const payload = await buildBackupPayload()
-  const fits = ratingStore.lineNos.map((lineNo) =>
-    fitPowerCurve(
+  // 拟合只使用挑点后剩余的点据，结论文本中的「已挑出」来自 lineStates
+  const fits = ratingStore.lineNos.map((lineNo) => {
+    const excluded = new Set(ratingStore.lineStateOf(lineNo).excludedIds)
+    return fitPowerCurve(
       payload.ratings
-        .filter((rating) => rating.lineNo === lineNo)
+        .filter((rating) => rating.lineNo === lineNo && !excluded.has(rating.id))
         .map((rating) => ({ stageM: rating.stageM, flowM3s: rating.flowM3s })),
       lineNo
     )
-  )
-  conclusions.value = buildConclusionLines(payload, fits)
+  })
+  conclusions.value = buildConclusionLines(payload, fits, ratingStore.lineStates)
 }
 
 async function handleExport(): Promise<void> {
@@ -290,7 +292,7 @@ onMounted(() => {
       <div class="gb-panel-title">
         <h3>全量 JSON 导入导出</h3>
         <span class="gb-hint">
-          导出内容包含 stations / sections / verticals / points / ratings / compares 六张表
+          导出内容包含 stations / sections / verticals / points / ratings / compares / lineStates 七张表
         </span>
       </div>
 
@@ -333,6 +335,9 @@ onMounted(() => {
         </el-descriptions-item>
         <el-descriptions-item label="点据 / 比测">
           {{ counts.ratings ?? 0 }} / {{ counts.compares ?? 0 }}
+        </el-descriptions-item>
+        <el-descriptions-item label="含挑点状态的定线">
+          {{ counts.lineStates ?? 0 }} 条
         </el-descriptions-item>
         <el-descriptions-item label="最近备份时间">
           {{ lastBackupAt ? new Date(lastBackupAt).toLocaleString('zh-CN') : '尚未备份' }}

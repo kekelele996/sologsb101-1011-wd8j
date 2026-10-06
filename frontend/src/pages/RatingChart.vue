@@ -1,9 +1,11 @@
 <script setup lang="ts">
 /**
  * 模块 5：/ratings 水位流量关系点据与定线
- * 幂函数拟合 Q = a×(H-H0)^b、残差展示、超限点据挂红，并同步 URL query。
+ * 幂函数拟合 Q = a×(H-H0)^b、残差展示、超限点据挂红；
+ * 定线员可按固定口径把明显偏离的点据挑出（不删除），改用剩余点据重定线，
+ * 曲线流量、残差与比测偏差统一切到新线，被挑出点据挂红留查。
  */
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, h, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Delete, Edit, Plus, Refresh, TrendCharts } from '@element-plus/icons-vue'
@@ -14,7 +16,7 @@ import DeviationTag from '@/components/common/DeviationTag.vue'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import { useRatingStore } from '@/stores/ratingStore'
 import { useStationStore } from '@/stores/stationStore'
-import { fitPowerCurve, type Rating, type RatingFitResult } from '@/types/rating'
+import { EXCLUSION_STRATEGY_LABELS, type ExclusionStrategy, type Rating } from '@/types/rating'
 import { initDatabase } from '@/utils/db'
 
 const route = useRoute()
@@ -35,29 +37,38 @@ const form = reactive({
 })
 
 const fit = computed(() => ratingStore.activeFit)
+const lineState = computed(() => ratingStore.activeLineState)
 const lineNos = computed(() => (ratingStore.lineNos.length > 0 ? ratingStore.lineNos : ['A']))
 
-/** 当前定线号下的点据（含曲线流量与残差） */
-const pointRows = computed(() =>
-  ratingStore.ratings
-    .filter((rating) => rating.lineNo === ratingStore.activeLineNo)
-    .sort((a, b) => a.stageM - b.stageM)
-    .map((rating) => {
-      const predicted = fit.value.valid ? Number((fit.value.a * Math.pow(Math.max(rating.stageM - fit.value.h0, 1e-6), fit.value.b)).toFixed(2)) : 0
-      const residualPct =
-        fit.value.valid && rating.flowM3s > 0
-          ? Number((((rating.flowM3s - predicted) / rating.flowM3s) * 100).toFixed(2))
-          : 0
-      const compare = ratingStore.compares.find((item) => item.ratingId === rating.id)
-      return {
-        rating,
-        stationName: ratingStore.stationNameOf(rating.stationId),
-        predicted,
-        residualPct,
-        verdict: compare?.verdict ?? (Math.abs(residualPct) > ratingStore.deviationLimitPct ? '超限' : '合格')
-      }
-    })
+/** 挑点口径：定线员二选一，执行后把所用口径写进该线说明 */
+const strategy = ref<ExclusionStrategy>('iterative')
+watch(
+  () => ratingStore.activeLineNo,
+  (lineNo) => {
+    strategy.value = ratingStore.lineStateOf(lineNo).strategy
+  }
 )
+
+/** 当前定线号下的全部点据（含已挑出者；曲线流量与残差均按挑点后的新线计算） */
+const pointRows = computed(() => ratingStore.pointRows)
+const includedRows = computed(() => pointRows.value.filter((row) => !row.excluded))
+const excludedRows = computed(() => pointRows.value.filter((row) => row.excluded))
+
+const strategyOptions = [
+  { value: 'once' as const, label: EXCLUSION_STRATEGY_LABELS.once, desc: '全部点据先定一条基准线，超过限值的一次挑完，再用剩余点据重定线' },
+  {
+    value: 'iterative' as const,
+    label: EXCLUSION_STRATEGY_LABELS.iterative,
+    desc: '从基准线上最偏的一个起逐个挑，每挑一个用剩余点据重定一次线，直到没有点超限'
+  }
+]
+
+/** 超限挂红判定：以比测记录为准，无记录时按当前新线残差与限值判定 */
+function verdictOf(ratingId: string, residualPct: number): '合格' | '超限' {
+  const compare = ratingStore.compares.find((item) => item.ratingId === ratingId)
+  if (compare) return compare.verdict
+  return Math.abs(residualPct) > ratingStore.deviationLimitPct ? '超限' : '合格'
+}
 
 const filterModel = computed<FilterModel>(() => ({
   keyword: ratingStore.filter.keyword,
@@ -66,11 +77,11 @@ const filterModel = computed<FilterModel>(() => ({
   verdicts: ratingStore.filter.verdicts
 }))
 
-/** 关系曲线坐标：横轴水位、纵轴流量 */
+/** 关系曲线坐标：横轴水位、纵轴流量；坐标范围覆盖全部点据（含已挑出者） */
 const chart = computed(() => {
   const rows = pointRows.value
   if (rows.length === 0) {
-    return { samples: '', points: [] as Array<{ id: string; cx: number; cy: number; verdict: string }>, stageMin: 0, stageMax: 0, flowMax: 0 }
+    return { samples: '', points: [] as Array<{ id: string; cx: number; cy: number; excluded: boolean; verdict: string }>, stageMin: 0, stageMax: 0, flowMax: 0 }
   }
   const stages = rows.map((row) => row.rating.stageM)
   const flows = rows.map((row) => row.rating.flowM3s)
@@ -96,7 +107,8 @@ const chart = computed(() => {
       id: row.rating.id,
       cx: toX(row.rating.stageM),
       cy: toY(row.rating.flowM3s),
-      verdict: row.verdict
+      excluded: row.excluded,
+      verdict: verdictOf(row.rating.id, row.residualPct)
     })),
     stageMin,
     stageMax,
@@ -108,7 +120,7 @@ function openCreate(): void {
   editingId.value = null
   form.stationId = stationStore.currentStationId ?? stationStore.stations[0]?.id ?? ''
   form.lineNo = ratingStore.activeLineNo
-  const last = pointRows.value[pointRows.value.length - 1]
+  const last = includedRows.value[includedRows.value.length - 1]
   form.stageM = last ? Number((last.rating.stageM + 0.2).toFixed(2)) : 3
   form.flowM3s = last ? Number((last.rating.flowM3s * 1.2).toFixed(1)) : 50
   form.measureNo = `${new Date().getFullYear()}-${String(ratingStore.ratings.length + 1).padStart(3, '0')}`
@@ -175,29 +187,93 @@ async function removeRating(rating: Rating): Promise<void> {
   } catch {
     return
   }
+  const lineNo = rating.lineNo
   await ratingStore.removeRating(rating.id)
-  await ratingStore.rebuildCompares(rating.lineNo)
+  // 清理挑点状态中已不存在的点据 id，避免「已挑出」计数悬空
+  const state = ratingStore.lineStateOf(lineNo)
+  if (state.excludedIds.includes(rating.id)) {
+    await ratingStore.applyPrunedLineState(lineNo, state.excludedIds.filter((id) => id !== rating.id))
+  }
+  await ratingStore.rebuildCompares(lineNo)
   ElMessage.success('点据已删除并重算定线')
 }
 
-async function refit(): Promise<void> {
-  const result: RatingFitResult = fitPowerCurve(
-    pointRows.value.map((row) => ({ stageM: row.rating.stageM, flowM3s: row.rating.flowM3s })),
-    ratingStore.activeLineNo
+/** 按所选口径先推演，再让定线员确认挑点方案 */
+async function excludeOverLimit(): Promise<void> {
+  const lineNo = ratingStore.activeLineNo
+  const plan = ratingStore.previewExclusion(lineNo, strategy.value)
+  if (plan.status === 'invalid') {
+    ElMessage.warning(plan.note)
+    return
+  }
+  if (plan.candidateIds.length === 0) {
+    ElMessage.info(plan.note)
+    return
+  }
+  const roundLines = plan.rounds.map(
+    (item) =>
+      `第 ${item.round} 轮：挑出水位 ${pointRows.value.find((row) => row.rating.id === item.removedId)?.rating.stageM.toFixed(2) ?? '?'} m 点据（残差 ${item.residualPct.toFixed(2)}%），剩 ${item.remaining} 点重定线`
   )
-  ratingStore.setFit(result)
+  try {
+    await ElMessageBox.confirm(
+      h('div', { class: 'gb-confirm-body' }, [
+        h('p', { class: 'gb-confirm-lead' }, `挑点口径：${EXCLUSION_STRATEGY_LABELS[strategy.value]}`),
+        h('p', null, plan.note),
+        ...roundLines.map((text) => h('p', { class: 'gb-hint gb-mono' }, text)),
+        !plan.applied
+          ? h('p', { style: 'color:#c0392b;font-weight:600' }, '本次挑点不会生效，将保留上一版线。')
+          : h('p', { class: 'gb-hint' }, '确认后改用剩余点据重定线，并同步刷新曲线流量、残差与比测偏差。')
+      ]),
+      '挑出偏离点据',
+      {
+        type: plan.applied ? 'warning' : 'error',
+        confirmButtonText: plan.applied ? '挑出并重定线' : '知道了',
+        cancelButtonText: '取消',
+        showCancelButton: plan.applied
+      }
+    )
+  } catch {
+    return
+  }
+  const applied = await ratingStore.applyExclusion(lineNo, strategy.value)
+  const count = await ratingStore.rebuildCompares(lineNo)
+  if (applied.applied) {
+    ElMessage.success(`已挑出 ${applied.excludedIds.length} 个偏离点据并用剩余点据重定线，刷新比测 ${count} 条`)
+  } else {
+    ElMessage.warning('剩余点据不足 3 个，已保留上一版线，原因已写入定线说明')
+  }
+}
+
+async function restoreAllPoints(): Promise<void> {
+  const lineNo = ratingStore.activeLineNo
+  try {
+    await ElMessageBox.confirm(
+      `将恢复 ${lineState.value.excludedIds.length} 个已挑出点据重新参与拟合，并用全部点据重定线，确认继续？`,
+      '恢复全部点据',
+      { type: 'warning', confirmButtonText: '恢复并重定线', cancelButtonText: '取消' }
+    )
+  } catch {
+    return
+  }
+  await ratingStore.clearLineExclusion(lineNo)
+  const count = await ratingStore.rebuildCompares(lineNo)
+  ElMessage.success(`已恢复全部点据参与拟合，刷新比测 ${count} 条`)
+}
+
+async function refit(): Promise<void> {
   const count = await ratingStore.rebuildCompares(ratingStore.activeLineNo)
-  if (result.valid) {
+  if (fit.value.valid) {
     ElMessage.success(
-      `定线完成：Q = ${result.a}×(H-${result.h0})^${result.b}，平均残差 ${result.meanResidualPct}%，刷新比测 ${count} 条`
+      `定线完成：Q = ${fit.value.a}×(H-${fit.value.h0})^${fit.value.b}，参与拟合 ${fit.value.sampleCount} 点，平均残差 ${fit.value.meanResidualPct}%，刷新比测 ${count} 条`
     )
   } else {
-    ElMessage.warning(result.message || '当前点据不足以定线')
+    ElMessage.warning(fit.value.message || '当前点据不足以定线')
   }
 }
 
 function handleLineChange(lineNo: string | number | boolean | undefined): void {
   ratingStore.setActiveLine(String(lineNo))
+  strategy.value = ratingStore.lineStateOf(String(lineNo)).strategy
   void ratingStore.rebuildCompares(String(lineNo))
 }
 
@@ -217,6 +293,10 @@ function handleReset(): void {
   void router.replace({ query: {} })
 }
 
+function rowClassName({ row }: { row: { excluded?: boolean } }): string {
+  return row.excluded ? 'row-excluded' : ''
+}
+
 onMounted(() => {
   if (stationStore.stations.length === 0) void initDatabase()
   const query = route.query
@@ -229,6 +309,7 @@ onMounted(() => {
         ? (query.verdict.split(',').filter((item) => item === '合格' || item === '超限') as Array<'合格' | '超限'>)
         : []
   })
+  strategy.value = ratingStore.activeLineState.strategy
   void ratingStore.rebuildCompares(ratingStore.activeLineNo)
 })
 </script>
@@ -241,7 +322,8 @@ onMounted(() => {
       <div>
         <h2 class="page__title">水位流量关系点据与定线</h2>
         <p class="gb-hint">
-          点据按定线号分组做幂函数拟合 Q = a×(H-H0)^b，残差超过 {{ ratingStore.deviationLimitPct }}% 的点据自动挂红并进入比测分析清单。
+          点据按定线号分组做幂函数拟合 Q = a×(H-H0)^b；残差超过 {{ ratingStore.deviationLimitPct }}% 自动挂红。
+          定线员可按固定口径挑出明显偏离的点据，被挑点据不参与拟合、仅留查，曲线与比测统一切到重定后的新线。
         </p>
       </div>
       <div class="page__actions">
@@ -280,8 +362,41 @@ onMounted(() => {
       @reset="handleReset"
     />
 
+    <el-card shadow="never" class="gb-panel page__exclude-card">
+      <div class="gb-panel-title">
+        <h3>偏离点据挑出</h3>
+        <span class="gb-hint">挑点只改参与拟合的点据集合，不删除点据；挑后剩余不足 3 点时保留上一版线并写明原因</span>
+      </div>
+      <el-radio-group v-model="strategy" class="page__strategy">
+        <el-radio v-for="option in strategyOptions" :key="option.value" :value="option.value" class="page__strategy-item">
+          <span class="page__strategy-label">{{ option.label }}</span>
+          <span class="gb-hint">（{{ option.desc }}）</span>
+        </el-radio>
+      </el-radio-group>
+      <div class="page__exclude-actions">
+        <el-button type="warning" plain :disabled="pointRows.length < 3" @click="excludeOverLimit">
+          按「{{ EXCLUSION_STRATEGY_LABELS[strategy] }}」挑出偏离点据
+        </el-button>
+        <el-button v-if="excludedRows.length > 0" @click="restoreAllPoints">
+          恢复全部点据（{{ excludedRows.length }}）
+        </el-button>
+        <el-tag type="success" effect="plain">参与拟合 {{ includedRows.length }} 点</el-tag>
+        <el-tag :type="excludedRows.length > 0 ? 'danger' : 'info'" effect="plain">
+          已挑出留查 {{ excludedRows.length }} 点
+        </el-tag>
+      </div>
+      <el-alert
+        v-if="lineState.note"
+        class="page__exclude-note"
+        :type="lineState.status === 'rolledback' || lineState.status === 'invalid' ? 'warning' : 'info'"
+        show-icon
+        :closable="false"
+        :title="`定线说明（口径：${EXCLUSION_STRATEGY_LABELS[lineState.strategy]}）：${lineState.note}`"
+      />
+    </el-card>
+
     <div class="gb-stats-row">
-      <StatBadge label="current 线点据" :value="pointRows.length" suffix="点" icon="DataLine" />
+      <StatBadge label="参与拟合点据" :value="includedRows.length" suffix="点" icon="DataLine" />
       <StatBadge
         label="定线系数 a"
         :value="fit.valid ? fit.a : '—'"
@@ -297,11 +412,11 @@ onMounted(() => {
         icon="Histogram"
       />
       <StatBadge
-        label="超限点据"
-        :value="pointRows.filter((row) => row.verdict === '超限').length"
-        suffix="点"
-        :tone="pointRows.some((row) => row.verdict === '超限') ? 'danger' : 'success'"
-        :icon="pointRows.some((row) => row.verdict === '超限') ? 'WarningFilled' : 'DataLine'"
+        label="已挑出 / 超限"
+        :value="excludedRows.length"
+        :suffix="`/ ${pointRows.filter((row) => verdictOf(row.rating.id, row.residualPct) === '超限').length} 点`"
+        :tone="excludedRows.length > 0 ? 'danger' : 'success'"
+        :icon="excludedRows.length > 0 ? 'WarningFilled' : 'DataLine'"
       />
     </div>
 
@@ -310,14 +425,14 @@ onMounted(() => {
       type="warning"
       show-icon
       :closable="false"
-      :title="fit.message || '当前定线号下点据不足，至少需要 3 个实测点才能定线'"
+      :title="fit.message || '当前定线号下参与拟合的点据不足，至少需要 3 个实测点才能定线'"
     />
     <el-alert
       v-else
       type="success"
       show-icon
       :closable="false"
-      :title="`${fit.lineNo} 线定线有效：Q = ${fit.a} × (H - ${fit.h0})^${fit.b}；样本 ${fit.sampleCount} 点，平均残差 ${fit.meanResidualPct}%，最大残差 ${fit.maxResidualPct}%`"
+      :title="`${fit.lineNo} 线定线有效：Q = ${fit.a} × (H - ${fit.h0})^${fit.b}；参与拟合 ${fit.sampleCount} 点，平均残差 ${fit.meanResidualPct}%，最大残差 ${fit.maxResidualPct}%`"
     />
 
     <div class="page__grid">
@@ -329,34 +444,51 @@ onMounted(() => {
         @action="openCreate"
       />
 
-      <el-table v-else :data="pointRows" border stripe class="gb-table-compact">
-        <el-table-column label="水位 (m)" width="110" align="right">
+      <el-table
+        v-else
+        :data="pointRows"
+        border
+        stripe
+        class="gb-table-compact"
+        :row-class-name="rowClassName"
+      >
+        <el-table-column label="水位 (m)" width="100" align="right">
           <template #default="{ row }">
             <span class="gb-mono">{{ row.rating.stageM.toFixed(2) }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="实测流量 (m³/s)" width="150" align="right">
+        <el-table-column label="实测流量 (m³/s)" width="140" align="right">
           <template #default="{ row }">
             <span class="gb-mono">{{ row.rating.flowM3s.toFixed(1) }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="曲线流量 (m³/s)" width="150" align="right">
+        <el-table-column label="曲线流量 (m³/s)" width="140" align="right">
           <template #default="{ row }">
             <span class="gb-mono">{{ row.predicted > 0 ? row.predicted.toFixed(1) : '—' }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="残差" width="200">
+        <el-table-column label="残差" width="190">
           <template #default="{ row }">
-            <DeviationTag :deviation-pct="row.residualPct" :verdict="row.verdict" :limit="ratingStore.deviationLimitPct" />
+            <DeviationTag
+              :deviation-pct="row.residualPct"
+              :verdict="verdictOf(row.rating.id, row.residualPct)"
+              :limit="ratingStore.deviationLimitPct"
+            />
           </template>
         </el-table-column>
-        <el-table-column label="测站 / 测次" min-width="180">
+        <el-table-column label="拟合状态" width="120" align="center">
           <template #default="{ row }">
-            <div>{{ row.stationName }}</div>
+            <el-tag v-if="row.excluded" type="danger" size="small" effect="dark">已挑出</el-tag>
+            <el-tag v-else type="success" size="small" effect="plain">参与拟合</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="测站 / 测次" min-width="170">
+          <template #default="{ row }">
+            <div>{{ row.rating.stationId ? ratingStore.stationNameOf(row.rating.stationId) : '未知测站' }}</div>
             <div class="gb-hint gb-mono">{{ row.rating.measureNo || '未标记测次' }}</div>
           </template>
         </el-table-column>
-        <el-table-column label="点据时间" width="170">
+        <el-table-column label="点据时间" width="120">
           <template #default="{ row }">
             <span class="gb-mono">{{ new Date(row.rating.measuredAt).toLocaleDateString('zh-CN') }}</span>
           </template>
@@ -382,18 +514,27 @@ onMounted(() => {
           <text x="52" y="208" class="gb-chart-axis">{{ chart.stageMin.toFixed(2) }}</text>
           <text x="300" y="208" class="gb-chart-axis">{{ chart.stageMax.toFixed(2) }} m</text>
           <polyline v-if="fit.valid" :points="chart.samples" fill="none" stroke="#0f4c75" stroke-width="2" />
-          <circle
-            v-for="point in chart.points"
-            :key="point.id"
-            :cx="point.cx"
-            :cy="point.cy"
-            r="4.5"
-            :fill="point.verdict === '超限' ? '#c0392b' : '#7fd1e8'"
-            :stroke="point.verdict === '超限' ? '#7b241c' : '#0f4c75'"
-          />
+          <template v-for="point in chart.points" :key="point.id">
+            <circle
+              v-if="!point.excluded"
+              :cx="point.cx"
+              :cy="point.cy"
+              r="4.5"
+              :fill="point.verdict === '超限' ? '#c0392b' : '#7fd1e8'"
+              :stroke="point.verdict === '超限' ? '#7b241c' : '#0f4c75'"
+            >
+              <title>{{ point.verdict === '超限' ? '残差超限点据' : '参与拟合点据' }}</title>
+            </circle>
+            <g v-else>
+              <circle :cx="point.cx" :cy="point.cy" r="5" fill="#fff" stroke="#c0392b" stroke-width="2" />
+              <line :x1="point.cx - 3.5" :y1="point.cy - 3.5" :x2="point.cx + 3.5" :y2="point.cy + 3.5" stroke="#c0392b" stroke-width="1.6" />
+              <line :x1="point.cx + 3.5" :y1="point.cy - 3.5" :x2="point.cx - 3.5" :y2="point.cy + 3.5" stroke="#c0392b" stroke-width="1.6" />
+              <title>已挑出点据（不参与拟合，仅留查）</title>
+            </g>
+          </template>
         </svg>
         <EmptyPanel v-else title="暂无可绘制的点据" description="录入点据后自动生成关系曲线。" compact />
-        <p class="gb-hint">红点表示残差超限的点据，曲线为幂函数定线成果。</p>
+        <p class="gb-hint">蓝点为参与拟合点据，红点为残差超限点据，红圈带叉为已挑出留查点据；曲线为挑点后重定的幂函数线。</p>
       </el-card>
     </div>
 
@@ -463,6 +604,41 @@ onMounted(() => {
   width: 120px;
 }
 
+.page__exclude-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.page__strategy {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  align-items: flex-start;
+}
+
+.page__strategy-item {
+  display: flex;
+  align-items: baseline;
+  margin-right: 0;
+  white-space: normal;
+}
+
+.page__strategy-label {
+  font-weight: 600;
+}
+
+.page__exclude-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.page__exclude-note {
+  margin-top: 2px;
+}
+
 .page__grid {
   display: grid;
   grid-template-columns: minmax(520px, 1.5fr) minmax(320px, 1fr);
@@ -487,6 +663,14 @@ onMounted(() => {
 
 .page__full {
   width: 100%;
+}
+
+:deep(.row-excluded) {
+  background-color: #fdf2f0 !important;
+}
+
+:deep(.row-excluded td) {
+  color: #9c6b63;
 }
 
 @media (max-width: 1180px) {

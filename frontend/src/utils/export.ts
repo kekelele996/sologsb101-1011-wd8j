@@ -11,6 +11,7 @@ import {
   stampBackupTime,
   type BackupPayload
 } from '@/utils/db'
+import type { LineState } from '@/types/rating'
 
 /** 备份集合键名 */
 export const BACKUP_KEYS = ['stations', 'sections', 'verticals', 'points', 'ratings', 'compares'] as const
@@ -21,13 +22,14 @@ export type CountMap = Record<BackupKey, number>
 
 /** 组装当前本地数据的完整快照 */
 export async function buildBackupPayload(): Promise<BackupPayload> {
-  const [stations, sections, verticals, points, ratings, compares] = await Promise.all([
+  const [stations, sections, verticals, points, ratings, compares, lineStates] = await Promise.all([
     db.stations.toArray(),
     db.sections.toArray(),
     db.verticals.toArray(),
     db.points.toArray(),
     db.ratings.toArray(),
-    db.compares.toArray()
+    db.compares.toArray(),
+    db.lineStates.toArray()
   ])
   return {
     app: 'gbhydrogaug',
@@ -38,7 +40,8 @@ export async function buildBackupPayload(): Promise<BackupPayload> {
     verticals,
     points,
     ratings,
-    compares
+    compares,
+    lineStates
   }
 }
 
@@ -56,6 +59,7 @@ export function validateBackup(input: unknown): { ok: boolean; errors: string[];
     if (!Array.isArray(obj[key])) errors.push(`${key} 字段缺失或不是数组`)
   }
   if (errors.length > 0) return { ok: false, errors, payload: null }
+  // lineStates 为 v3 新增，旧备份没有该字段，按空表处理
   const payload: BackupPayload = {
     app: 'gbhydrogaug',
     dbVersion: typeof obj.dbVersion === 'number' ? obj.dbVersion : DB_VERSION,
@@ -65,7 +69,8 @@ export function validateBackup(input: unknown): { ok: boolean; errors: string[];
     verticals: obj.verticals ?? [],
     points: obj.points ?? [],
     ratings: obj.ratings ?? [],
-    compares: obj.compares ?? []
+    compares: obj.compares ?? [],
+    lineStates: Array.isArray(obj.lineStates) ? obj.lineStates : []
   }
   return { ok: true, errors, payload }
 }
@@ -116,7 +121,7 @@ export async function importBackup(payload: BackupPayload, overwrite: boolean): 
   if (overwrite) await clearAllTables()
   await db.transaction(
     'rw',
-    [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares],
+    [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares, db.lineStates],
     async () => {
       await db.stations.bulkPut(payload.stations)
       await db.sections.bulkPut(payload.sections)
@@ -124,6 +129,8 @@ export async function importBackup(payload: BackupPayload, overwrite: boolean): 
       await db.points.bulkPut(payload.points)
       await db.ratings.bulkPut(payload.ratings)
       await db.compares.bulkPut(payload.compares)
+      // 覆盖模式直接带入挑点状态；追加模式的挑点状态在 remapIds 中已清空，避免按旧 id 误挑
+      await db.lineStates.bulkPut(payload.lineStates)
     }
   )
   return countPayload(payload)
@@ -166,7 +173,8 @@ export function remapIds(payload: BackupPayload): BackupPayload {
     id: createId('cmp'),
     ratingId: ratingMap.get(compare.ratingId) ?? compare.ratingId
   }))
-  return { ...payload, stations, sections, verticals, points, ratings, compares }
+  // 追加模式下定线号与点据 id 均可能与现有数据冲突，挑点状态不带入，由定线员重新挑点
+  return { ...payload, stations, sections, verticals, points, ratings, compares, lineStates: [] }
 }
 
 /**
@@ -186,7 +194,8 @@ export interface ConclusionLine {
 
 export function buildConclusionLines(
   payload: BackupPayload,
-  fits: Array<{ lineNo: string; valid: boolean; a: number; b: number; h0: number; meanResidualPct: number; sampleCount: number }>
+  fits: Array<{ lineNo: string; valid: boolean; a: number; b: number; h0: number; meanResidualPct: number; sampleCount: number }>,
+  lineStates: LineState[] = []
 ): ConclusionLine[] {
   return payload.stations.map((station) => {
     const sections = payload.sections.filter((section) => section.stationId === station.id)
@@ -202,8 +211,13 @@ export function buildConclusionLines(
     const lines = Array.from(new Set(ratings.map((rating) => rating.lineNo)))
     const fitParts = lines.map((lineNo) => {
       const fit = fits.find((item) => item.lineNo === lineNo)
+      const state = lineStates.find((item) => item.lineNo === lineNo)
+      const excludedHere = state
+        ? state.excludedIds.filter((id) => ratingIds.has(id)).length
+        : 0
       if (!fit || !fit.valid) return `${lineNo} 线未定线`
-      return `${lineNo} 线 Q=${fit.a}·(H-${fit.h0})^${fit.b}，残差 ${fit.meanResidualPct}%（${fit.sampleCount} 点）`
+      const base = `${lineNo} 线 Q=${fit.a}·(H-${fit.h0})^${fit.b}，残差 ${fit.meanResidualPct}%（${fit.sampleCount} 点）`
+      return excludedHere > 0 ? `${base}，已挑出偏离点 ${excludedHere} 个不参与拟合` : base
     })
     return {
       stationId: station.id,

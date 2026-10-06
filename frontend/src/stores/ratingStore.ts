@@ -1,26 +1,40 @@
 /**
  * 定线 store：维护水位流量关系点据、比测记录、定线参数与残差派生值。
  * 供关系点据页（/ratings）与导出页（/export）共用。
+ *
+ * 偏离点据挑出（不删除点据）：每条定线号在 lineStates 表中记录被挑出点据 id、
+ * 挑出口径与页面说明；allFits / activeFit 只用未被挑出的点据拟合，
+ * 被挑出点据的曲线流量、残差与比测偏差仍按新线计算，仅挂红留查。
  */
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import { db, createId, watchTable } from '@/utils/db'
 import type { Compare } from '@/types/compare'
 import { DEVIATION_LIMIT_PCT, calcDeviationPct, judgeDeviation, type CompareRow } from '@/types/compare'
-import type { Rating, RatingFitResult } from '@/types/rating'
-import { createEmptyRatingFilter, curveFlow, fitPowerCurve, type RatingFilterState } from '@/types/rating'
+import {
+  createEmptyLineState,
+  curveFlow,
+  fitPowerCurve,
+  planExclusion,
+  type ExclusionPlan,
+  type ExclusionStrategy,
+  type LineState,
+  type Rating,
+  type RatingFitResult
+} from '@/types/rating'
+import { createEmptyRatingFilter, type RatingFilterState } from '@/types/rating'
 import type { Station } from '@/types/station'
 
 export const useRatingStore = defineStore('rating', () => {
   const ratings = ref<Rating[]>([])
   const compares = ref<Compare[]>([])
   const stations = ref<Station[]>([])
+  const lineStates = ref<LineState[]>([])
   const ready = ref(false)
   const error = ref<string | null>(null)
   const filter = ref<RatingFilterState>(createEmptyRatingFilter())
-  /** 当前定线号与定线参数（跨页保留） */
+  /** 当前定线号（跨页保留） */
   const activeLineNo = ref<string>('A')
-  const fits = ref<RatingFitResult[]>([])
   const deviationLimitPct = ref<number>(DEVIATION_LIMIT_PCT)
 
   let started = false
@@ -39,6 +53,9 @@ export const useRatingStore = defineStore('rating', () => {
     watchTable<Station>(() => db.stations).subscribe((rows) => {
       stations.value = rows
     })
+    watchTable<LineState>(() => db.lineStates).subscribe((rows) => {
+      lineStates.value = rows
+    })
   }
 
   const lineNos = computed<string[]>(() => {
@@ -50,38 +67,62 @@ export const useRatingStore = defineStore('rating', () => {
   const stationNameOf = (stationId: string): string =>
     stations.value.find((station) => station.id === stationId)?.name ?? '未知测站'
 
-  /** 逐定线号的拟合结果（幂函数定线） */
+  /** 某条线的挑点定线状态（未挑过时返回空状态） */
+  function lineStateOf(lineNo: string): LineState {
+    return lineStates.value.find((state) => state.lineNo === lineNo) ?? createEmptyLineState(lineNo)
+  }
+
+  /** 某条线被挑出、不参与拟合的点据 id 集合 */
+  function excludedIdSetOf(lineNo: string): Set<string> {
+    return new Set(lineStateOf(lineNo).excludedIds)
+  }
+
+  /** 某条线实际参与拟合的点据（排除已挑出且已不存在的 id） */
+  function effectivePointsOf(lineNo: string): Rating[] {
+    const excluded = excludedIdSetOf(lineNo)
+    return ratings.value.filter((rating) => rating.lineNo === lineNo && !excluded.has(rating.id))
+  }
+
+  /** 逐定线号的拟合结果：只用挑点后剩余点据做幂函数定线 */
   const allFits = computed<RatingFitResult[]>(() =>
     lineNos.value.map((lineNo) => {
-      const points = ratings.value
-        .filter((rating) => rating.lineNo === lineNo)
-        .map((rating) => ({ stageM: rating.stageM, flowM3s: rating.flowM3s }))
+      const points = effectivePointsOf(lineNo).map((rating) => ({
+        stageM: rating.stageM,
+        flowM3s: rating.flowM3s
+      }))
       return fitPowerCurve(points, lineNo)
     })
   )
 
+  const activeLineState = computed<LineState>(() => lineStateOf(activeLineNo.value))
+
   const activeFit = computed<RatingFitResult>(() => {
-    const cached = fits.value.find((fit) => fit.lineNo === activeLineNo.value)
-    if (cached) return cached
-    const computedFit = allFits.value.find((fit) => fit.lineNo === activeLineNo.value)
-    if (computedFit) return computedFit
+    const found = allFits.value.find((fit) => fit.lineNo === activeLineNo.value)
+    if (found) return found
     return fitPowerCurve([], activeLineNo.value)
   })
 
-  /** 点据 + 曲线流量 + 残差 */
-  const pointRows = computed(() =>
-    ratings.value
+  /** 点据 + 曲线流量 + 残差（全部点据，含已挑出者，均按当前新线计算） */
+  const pointRows = computed(() => {
+    const current = activeFit.value
+    const excluded = excludedIdSetOf(activeLineNo.value)
+    return ratings.value
       .filter((rating) => rating.lineNo === activeLineNo.value)
       .sort((a, b) => a.stageM - b.stageM)
       .map((rating) => {
-        const predicted = activeFit.value.valid ? curveFlow(activeFit.value, rating.stageM) : 0
+        const predicted = current.valid ? curveFlow(current, rating.stageM) : 0
         const residualPct =
-          activeFit.value.valid && rating.flowM3s > 0
+          current.valid && rating.flowM3s > 0
             ? Number((((rating.flowM3s - predicted) / rating.flowM3s) * 100).toFixed(2))
             : 0
-        return { rating, predicted, residualPct }
+        return {
+          rating,
+          predicted,
+          residualPct,
+          excluded: excluded.has(rating.id)
+        }
       })
-  )
+  })
 
   /** 按筛选条件过滤后的点据 */
   const filteredRatings = computed<Rating[]>(() =>
@@ -157,11 +198,6 @@ export const useRatingStore = defineStore('rating', () => {
     activeLineNo.value = lineNo
   }
 
-  function setFit(fit: RatingFitResult): void {
-    const others = fits.value.filter((item) => item.lineNo !== fit.lineNo)
-    fits.value = [...others, fit]
-  }
-
   function setDeviationLimit(limit: number): void {
     deviationLimitPct.value = limit
   }
@@ -187,18 +223,78 @@ export const useRatingStore = defineStore('rating', () => {
   }
 
   /**
-   * 由点据生成 / 刷新比测记录：曲线流量取当前定线拟合值，
-   * 偏差超过限值自动判定超限并进入分析清单。
+   * 按固定口径推演挑点方案（不落库），供页面确认前展示。
+   */
+  function previewExclusion(lineNo: string, strategy: ExclusionStrategy): ExclusionPlan {
+    const points = ratings.value.filter((rating) => rating.lineNo === lineNo)
+    return planExclusion(points, strategy, deviationLimitPct.value, lineNo)
+  }
+
+  /**
+   * 执行挑点并把口径、被挑点据与页面说明写入 lineStates：
+   * - 方案可应用：以方案结果替换该线定线状态，并用剩余点据重定线；
+   * - 剩余不足 3 点 / 新线无效：保留上一版线（原有挑点不动），仅写明原因。
+   * 返回落库后的定线状态。
+   */
+  async function applyExclusion(lineNo: string, strategy: ExclusionStrategy): Promise<ExclusionPlan> {
+    const plan = previewExclusion(lineNo, strategy)
+    const previous = lineStateOf(lineNo)
+    const next: LineState = plan.applied
+      ? {
+          lineNo,
+          excludedIds: plan.excludedIds,
+          strategy,
+          note: plan.note,
+          status: plan.status,
+          updatedAt: Date.now()
+        }
+      : {
+          // 保留上一版线：沿用上一版被挑点据，只记录本次口径与保留原因
+          lineNo,
+          excludedIds: previous.excludedIds,
+          strategy,
+          note: plan.note,
+          status: plan.status,
+          updatedAt: Date.now()
+        }
+    await db.lineStates.put(next)
+    return plan
+  }
+
+  /** 恢复该线全部点据参与拟合（清空挑点状态） */
+  async function clearLineExclusion(lineNo: string): Promise<void> {
+    await db.lineStates.delete(lineNo)
+  }
+
+  /**
+   * 删除点据后修剪该线挑点状态中已不存在的 id：
+   * 仍有被挑点据时保留口径并注明，全部清空则删除状态（恢复全线拟合）。
+   */
+  async function applyPrunedLineState(lineNo: string, remainingExcludedIds: string[]): Promise<void> {
+    if (remainingExcludedIds.length === 0) {
+      await db.lineStates.delete(lineNo)
+      return
+    }
+    const previous = lineStateOf(lineNo)
+    await db.lineStates.put({
+      ...previous,
+      lineNo,
+      excludedIds: remainingExcludedIds,
+      note: `${previous.note}（删除点据后自动核对，当前 ${remainingExcludedIds.length} 个点据处于挑出留查状态）`,
+      updatedAt: Date.now()
+    })
+  }
+
+  /**
+   * 由点据生成 / 刷新比测记录：曲线流量取挑点后重定的新线，
+   * 全部点据（含被挑出者）都按新线计算偏差；超限自动判定并进入分析清单。
    */
   async function rebuildCompares(lineNo?: string): Promise<number> {
     const targetLine = lineNo ?? activeLineNo.value
     const fit = fitPowerCurve(
-      ratings.value
-        .filter((rating) => rating.lineNo === targetLine)
-        .map((rating) => ({ stageM: rating.stageM, flowM3s: rating.flowM3s })),
+      effectivePointsOf(targetLine).map((rating) => ({ stageM: rating.stageM, flowM3s: rating.flowM3s })),
       targetLine
     )
-    setFit(fit)
     const targets = ratings.value.filter((rating) => rating.lineNo === targetLine)
     if (targets.length === 0) return 0
     const now = Date.now()
@@ -257,12 +353,13 @@ export const useRatingStore = defineStore('rating', () => {
     ratings,
     compares,
     stations,
+    lineStates,
     ready,
     error,
     filter,
     activeLineNo,
+    activeLineState,
     activeFit,
-    fits,
     deviationLimitPct,
     lineNos,
     allFits,
@@ -274,14 +371,19 @@ export const useRatingStore = defineStore('rating', () => {
     fitQuality,
     start,
     stationNameOf,
+    lineStateOf,
+    effectivePointsOf,
     patchFilter,
     resetFilter,
     setActiveLine,
-    setFit,
     setDeviationLimit,
     createRating,
     updateRating,
     removeRating,
+    previewExclusion,
+    applyExclusion,
+    clearLineExclusion,
+    applyPrunedLineState,
     rebuildCompares,
     createCompare,
     updateCompare,

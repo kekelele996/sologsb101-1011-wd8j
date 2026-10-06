@@ -10,14 +10,14 @@ import type { Station } from '@/types/station'
 import type { Section } from '@/types/section'
 import type { Vertical } from '@/types/vertical'
 import type { Point } from '@/types/point'
-import type { Rating } from '@/types/rating'
+import type { LineState, Rating } from '@/types/rating'
 import type { Compare } from '@/types/compare'
 import { calcDeviationPct, judgeDeviation } from '@/types/compare'
 import { fitPowerCurve } from '@/types/rating'
 import { calcMeanVelocity, DEFAULT_WEIGHTS, round } from '@/utils/flow'
 
 /** 当前数据结构版本号：每次调整字段结构必须 +1 并补迁移 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 /** 数据库名（浏览器 IndexedDB 中的库名） */
 export const DB_NAME = 'gbhydrogaug'
@@ -40,6 +40,8 @@ export interface BackupPayload {
   points: Point[]
   ratings: Rating[]
   compares: Compare[]
+  /** 按定线号记录的挑点口径、被挑点据与说明 */
+  lineStates: LineState[]
 }
 
 class HydroGaugeDatabase extends Dexie {
@@ -49,6 +51,7 @@ class HydroGaugeDatabase extends Dexie {
   points!: Table<Point, string>
   ratings!: Table<Rating, string>
   compares!: Table<Compare, string>
+  lineStates!: Table<LineState, string>
 
   constructor() {
     super(DB_NAME)
@@ -95,6 +98,12 @@ class HydroGaugeDatabase extends Dexie {
             })
         }
       })
+
+    // v3：新增 lineStates 表，按定线号持久化挑点口径、被挑出点据 id 与页面说明。
+    // 点据不删除、不加标记列，是否参与拟合一律由 lineStates.excludedIds 决定。
+    this.version(DB_VERSION).stores({
+      lineStates: 'lineNo, strategy, status, updatedAt'
+    })
   }
 }
 
@@ -375,7 +384,7 @@ export async function initDatabase(): Promise<void> {
 export async function clearAllTables(): Promise<void> {
   await db.transaction(
     'rw',
-    [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares],
+    [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares, db.lineStates],
     async () => {
       await Promise.all([
         db.stations.clear(),
@@ -383,7 +392,8 @@ export async function clearAllTables(): Promise<void> {
         db.verticals.clear(),
         db.points.clear(),
         db.ratings.clear(),
-        db.compares.clear()
+        db.compares.clear(),
+        db.lineStates.clear()
       ])
     }
   )
@@ -397,15 +407,16 @@ export async function resetDatabase(): Promise<void> {
 
 /** 统计各表行数，供页脚概览与导出页展示 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [stations, sections, verticals, points, ratings, compares] = await Promise.all([
+  const [stations, sections, verticals, points, ratings, compares, lineStates] = await Promise.all([
     db.stations.count(),
     db.sections.count(),
     db.verticals.count(),
     db.points.count(),
     db.ratings.count(),
-    db.compares.count()
+    db.compares.count(),
+    db.lineStates.count()
   ])
-  return { stations, sections, verticals, points, ratings, compares }
+  return { stations, sections, verticals, points, ratings, compares, lineStates }
 }
 
 /** 写入结构版本号到 localStorage，便于导出页比对 */

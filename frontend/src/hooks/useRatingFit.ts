@@ -27,6 +27,8 @@ export interface RatingPointRow {
   curveFlowM3s: number
   /** 相对残差（%）：(实测 - 曲线) / 实测 × 100 */
   residualPct: number
+  /** 是否已被挑出（不参与拟合，仅留查） */
+  excluded: boolean
   fit: RatingFitResult
 }
 
@@ -50,8 +52,8 @@ export interface UseRatingFitResult {
   /** 超限点据对应的比测记录 */
   overLimitCompares: ComputedRef<Compare[]>
   setActiveLine: (lineNo: string) => void
-  /** 按当前点据重算定线参数并回写 store */
-  refit: () => RatingFitResult
+  /** 按当前点据（含挑点状态）重算定线参数并刷新比测 */
+  refit: () => Promise<RatingFitResult>
 }
 
 /**
@@ -76,8 +78,8 @@ export function useRatingFit(initialLineNo = 'A'): UseRatingFitResult {
 
   const allFits = computed<RatingFitResult[]>(() =>
     lineNos.value.map((lineNo) => {
-      const points = ratings.value
-        .filter((rating) => rating.lineNo === lineNo)
+      const points = ratingStore
+        .effectivePointsOf(lineNo)
         .map((rating) => ({ stageM: rating.stageM, flowM3s: rating.flowM3s }))
       return fitPowerCurve(points, lineNo)
     })
@@ -91,6 +93,7 @@ export function useRatingFit(initialLineNo = 'A'): UseRatingFitResult {
 
   const pointRows = computed<RatingPointRow[]>(() => {
     const current = fit.value
+    const excluded = new Set(ratingStore.lineStateOf(activeLineNo.value).excludedIds)
     return ratings.value
       .filter((rating) => rating.lineNo === activeLineNo.value)
       .sort((a, b) => a.stageM - b.stageM)
@@ -105,6 +108,7 @@ export function useRatingFit(initialLineNo = 'A'): UseRatingFitResult {
           stationName: stationNameOf(rating.stationId),
           curveFlowM3s: predicted,
           residualPct,
+          excluded: excluded.has(rating.id),
           fit: current
         }
       })
@@ -126,8 +130,9 @@ export function useRatingFit(initialLineNo = 'A'): UseRatingFitResult {
 
   const overLimitRows = computed<RatingPointRow[]>(() => {
     const limit = ratingStore.deviationLimitPct
-    return allFits.value.flatMap((item) =>
-      ratings.value
+    return allFits.value.flatMap((item) => {
+      const excluded = new Set(ratingStore.lineStateOf(item.lineNo).excludedIds)
+      return ratings.value
         .filter((rating) => rating.lineNo === item.lineNo)
         .map((rating) => {
           const predicted = item.valid ? curveFlow(item, rating.stageM) : 0
@@ -140,11 +145,12 @@ export function useRatingFit(initialLineNo = 'A'): UseRatingFitResult {
             stationName: stationNameOf(rating.stationId),
             curveFlowM3s: predicted,
             residualPct,
+            excluded: excluded.has(rating.id),
             fit: item
           }
         })
         .filter((row) => Math.abs(row.residualPct) > limit)
-    )
+    })
   })
 
   const overLimitCompares = computed<Compare[]>(() =>
@@ -155,13 +161,9 @@ export function useRatingFit(initialLineNo = 'A'): UseRatingFitResult {
     activeLineNo.value = lineNo
   }
 
-  function refit(): RatingFitResult {
-    const points = ratings.value
-      .filter((rating) => rating.lineNo === activeLineNo.value)
-      .map((rating) => ({ stageM: rating.stageM, flowM3s: rating.flowM3s }))
-    const result = fitPowerCurve(points, activeLineNo.value)
-    ratingStore.setFit(result)
-    return result
+  async function refit(): Promise<RatingFitResult> {
+    await ratingStore.rebuildCompares(activeLineNo.value)
+    return fit.value
   }
 
   return {
