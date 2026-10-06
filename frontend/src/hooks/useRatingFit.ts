@@ -27,6 +27,8 @@ export interface RatingPointRow {
   curveFlowM3s: number
   /** 相对残差（%）：(实测 - 曲线) / 实测 × 100 */
   residualPct: number
+  /** 是否被挑出、不参与拟合（被挑出的点据仍可查询） */
+  excluded: boolean
   fit: RatingFitResult
 }
 
@@ -76,8 +78,8 @@ export function useRatingFit(initialLineNo = 'A'): UseRatingFitResult {
 
   const allFits = computed<RatingFitResult[]>(() =>
     lineNos.value.map((lineNo) => {
-      const points = ratings.value
-        .filter((rating) => rating.lineNo === lineNo)
+      const points = ratingStore
+        .fittingRatingsOfLine(lineNo)
         .map((rating) => ({ stageM: rating.stageM, flowM3s: rating.flowM3s }))
       return fitPowerCurve(points, lineNo)
     })
@@ -91,6 +93,7 @@ export function useRatingFit(initialLineNo = 'A'): UseRatingFitResult {
 
   const pointRows = computed<RatingPointRow[]>(() => {
     const current = fit.value
+    const excludedIds = ratingStore.excludedIdsOfLine(activeLineNo.value)
     return ratings.value
       .filter((rating) => rating.lineNo === activeLineNo.value)
       .sort((a, b) => a.stageM - b.stageM)
@@ -105,6 +108,7 @@ export function useRatingFit(initialLineNo = 'A'): UseRatingFitResult {
           stationName: stationNameOf(rating.stationId),
           curveFlowM3s: predicted,
           residualPct,
+          excluded: excludedIds.has(rating.id),
           fit: current
         }
       })
@@ -112,7 +116,7 @@ export function useRatingFit(initialLineNo = 'A'): UseRatingFitResult {
 
   const curveSamples = computed<CurveSample[]>(() => {
     const current = fit.value
-    const rows = pointRows.value
+    const rows = pointRows.value.filter((row) => !row.excluded)
     if (!current.valid || rows.length === 0) return []
     const stages = rows.map((row) => row.rating.stageM)
     const min = Math.min(...stages)
@@ -127,8 +131,8 @@ export function useRatingFit(initialLineNo = 'A'): UseRatingFitResult {
   const overLimitRows = computed<RatingPointRow[]>(() => {
     const limit = ratingStore.deviationLimitPct
     return allFits.value.flatMap((item) =>
-      ratings.value
-        .filter((rating) => rating.lineNo === item.lineNo)
+      ratingStore
+        .fittingRatingsOfLine(item.lineNo)
         .map((rating) => {
           const predicted = item.valid ? curveFlow(item, rating.stageM) : 0
           const residualPct =
@@ -140,6 +144,7 @@ export function useRatingFit(initialLineNo = 'A'): UseRatingFitResult {
             stationName: stationNameOf(rating.stationId),
             curveFlowM3s: predicted,
             residualPct,
+            excluded: false,
             fit: item
           }
         })

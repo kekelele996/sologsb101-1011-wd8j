@@ -12,12 +12,13 @@ import type { Vertical } from '@/types/vertical'
 import type { Point } from '@/types/point'
 import type { Rating } from '@/types/rating'
 import type { Compare } from '@/types/compare'
+import type { RatingLineSetting } from '@/types/ratingLine'
 import { calcDeviationPct, judgeDeviation } from '@/types/compare'
 import { fitPowerCurve } from '@/types/rating'
 import { calcMeanVelocity, DEFAULT_WEIGHTS, round } from '@/utils/flow'
 
 /** 当前数据结构版本号：每次调整字段结构必须 +1 并补迁移 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 /** 数据库名（浏览器 IndexedDB 中的库名） */
 export const DB_NAME = 'gbhydrogaug'
@@ -40,6 +41,8 @@ export interface BackupPayload {
   points: Point[]
   ratings: Rating[]
   compares: Compare[]
+  /** 各定线号的挑点设置（剔除点据、口径、备注）；旧备份可缺省 */
+  linesettings: RatingLineSetting[]
 }
 
 class HydroGaugeDatabase extends Dexie {
@@ -49,6 +52,7 @@ class HydroGaugeDatabase extends Dexie {
   points!: Table<Point, string>
   ratings!: Table<Rating, string>
   compares!: Table<Compare, string>
+  linesettings!: Table<RatingLineSetting, string>
 
   constructor() {
     super(DB_NAME)
@@ -64,7 +68,7 @@ class HydroGaugeDatabase extends Dexie {
     })
 
     // v2：补齐筛选与统计需要的索引（河名/集水面积、水位、测法、偏差判定）
-    this.version(DB_VERSION)
+    this.version(2)
       .stores({
         stations: 'id, name, river, sectionCode, catchmentKm2, updatedAt',
         sections: 'id, stationId, measureNo, method, stageM, measuredAt, updatedAt',
@@ -95,6 +99,18 @@ class HydroGaugeDatabase extends Dexie {
             })
         }
       })
+
+    // v3：新增 linesettings 表（每定线号一份挑点设置）。
+    // 历史库没有该表，Dexie 会自动创建；旧定线默认不剔除任何点据，无需回填。
+    this.version(DB_VERSION).stores({
+      stations: 'id, name, river, sectionCode, catchmentKm2, updatedAt',
+      sections: 'id, stationId, measureNo, method, stageM, measuredAt, updatedAt',
+      verticals: 'id, sectionId, no, startDistanceM, depthM, updatedAt',
+      points: 'id, verticalId, relativeDepth, velocityMs, updatedAt',
+      ratings: 'id, stationId, lineNo, stageM, flowM3s, measuredAt, updatedAt',
+      compares: 'id, ratingId, verdict, deviationPct, comparedAt, updatedAt',
+      linesettings: 'id, lineNo, updatedAt'
+    })
   }
 }
 
@@ -280,16 +296,18 @@ export async function seedDemoData(): Promise<void> {
     { id: 'rat_qj_b2', stationId: 'stn_qj02', stageM: 3.18, flowM3s: 56.1, lineNo: 'B', measureNo: '2024-05-003', measuredAt: '2024-05-22T07:50:00.000Z' },
     { id: 'rat_qj_b3', stationId: 'stn_qj02', stageM: 3.72, flowM3s: 78.4, lineNo: 'B', measureNo: '2024-07-001', measuredAt: '2024-07-02T08:10:00.000Z' },
     { id: 'rat_qj_b4', stationId: 'stn_qj02', stageM: 4.36, flowM3s: 115.6, lineNo: 'B', measureNo: '2024-08-004', measuredAt: '2024-08-09T06:40:00.000Z' },
-    // C 线：含两个明显偏离点，用于演示超限挂红与偏差分析
+    // C 线：含两个明显偏离点（c3 偏大、c5 偏小），用于演示超限挂红、挑点剔除与偏差分析
     { id: 'rat_bs_c1', stationId: 'stn_bs03', stageM: 4.9, flowM3s: 168.0, lineNo: 'C', measureNo: '2024-05-004', measuredAt: '2024-05-28T09:00:00.000Z' },
     { id: 'rat_bs_c2', stationId: 'stn_bs03', stageM: 5.36, flowM3s: 203.5, lineNo: 'C', measureNo: '2024-06-005', measuredAt: '2024-06-20T10:05:00.000Z' },
-    { id: 'rat_bs_c3', stationId: 'stn_bs03', stageM: 5.88, flowM3s: 325.0, lineNo: 'C', measureNo: '2024-07-007', measuredAt: '2024-07-25T09:30:00.000Z' },
-    { id: 'rat_bs_c4', stationId: 'stn_bs03', stageM: 6.44, flowM3s: 288.0, lineNo: 'C', measureNo: '2024-08-008', measuredAt: '2024-08-15T09:40:00.000Z' }
+    { id: 'rat_bs_c3', stationId: 'stn_bs03', stageM: 5.88, flowM3s: 320.0, lineNo: 'C', measureNo: '2024-07-007', measuredAt: '2024-07-25T09:30:00.000Z' },
+    { id: 'rat_bs_c4', stationId: 'stn_bs03', stageM: 6.15, flowM3s: 312.0, lineNo: 'C', measureNo: '2024-07-018', measuredAt: '2024-07-30T09:20:00.000Z' },
+    { id: 'rat_bs_c5', stationId: 'stn_bs03', stageM: 6.44, flowM3s: 260.0, lineNo: 'C', measureNo: '2024-08-008', measuredAt: '2024-08-15T09:40:00.000Z' },
+    { id: 'rat_bs_c6', stationId: 'stn_bs03', stageM: 7.05, flowM3s: 430.0, lineNo: 'C', measureNo: '2024-09-009', measuredAt: '2024-09-12T09:50:00.000Z' }
   ]
 
   await db.transaction(
     'rw',
-    [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares],
+    [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares, db.linesettings],
     async () => {
       const stamp = (row: { id: string }): { createdAt: number; updatedAt: number } => ({
         createdAt: now + row.id.length,
@@ -375,7 +393,7 @@ export async function initDatabase(): Promise<void> {
 export async function clearAllTables(): Promise<void> {
   await db.transaction(
     'rw',
-    [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares],
+    [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares, db.linesettings],
     async () => {
       await Promise.all([
         db.stations.clear(),
@@ -383,7 +401,8 @@ export async function clearAllTables(): Promise<void> {
         db.verticals.clear(),
         db.points.clear(),
         db.ratings.clear(),
-        db.compares.clear()
+        db.compares.clear(),
+        db.linesettings.clear()
       ])
     }
   )
@@ -397,15 +416,16 @@ export async function resetDatabase(): Promise<void> {
 
 /** 统计各表行数，供页脚概览与导出页展示 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [stations, sections, verticals, points, ratings, compares] = await Promise.all([
+  const [stations, sections, verticals, points, ratings, compares, linesettings] = await Promise.all([
     db.stations.count(),
     db.sections.count(),
     db.verticals.count(),
     db.points.count(),
     db.ratings.count(),
-    db.compares.count()
+    db.compares.count(),
+    db.linesettings.count()
   ])
-  return { stations, sections, verticals, points, ratings, compares }
+  return { stations, sections, verticals, points, ratings, compares, linesettings }
 }
 
 /** 写入结构版本号到 localStorage，便于导出页比对 */

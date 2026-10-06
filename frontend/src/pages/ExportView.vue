@@ -71,14 +71,17 @@ async function refreshCounts(): Promise<void> {
 
 async function buildConclusions(): Promise<void> {
   const payload = await buildBackupPayload()
-  const fits = ratingStore.lineNos.map((lineNo) =>
-    fitPowerCurve(
+  // 定线成果与关系点据页一致：剔除被挑出的点据后再拟合（linesettings 已含在备份里）
+  const fits = ratingStore.lineNos.map((lineNo) => {
+    const setting = payload.linesettings.find((item) => item.lineNo === lineNo) ?? null
+    const excluded = new Set(setting?.excludedRatingIds ?? [])
+    return fitPowerCurve(
       payload.ratings
-        .filter((rating) => rating.lineNo === lineNo)
+        .filter((rating) => rating.lineNo === lineNo && !excluded.has(rating.id))
         .map((rating) => ({ stageM: rating.stageM, flowM3s: rating.flowM3s })),
       lineNo
     )
-  )
+  })
   conclusions.value = buildConclusionLines(payload, fits)
 }
 
@@ -290,7 +293,7 @@ onMounted(() => {
       <div class="gb-panel-title">
         <h3>全量 JSON 导入导出</h3>
         <span class="gb-hint">
-          导出内容包含 stations / sections / verticals / points / ratings / compares 六张表
+          导出内容包含 stations / sections / verticals / points / ratings / compares / linesettings 七张表（含各定线挑点设置）
         </span>
       </div>
 
